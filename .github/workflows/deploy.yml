@@ -2,13 +2,13 @@ name: Deploy
 
 on:
   push:
-    branches: ['master', 'prerelease']
+    branches: ['master', 'pre-release']
     paths-ignore: 'docs/**'
 
 env:
   RUST_BACKTRACE: 1
   PRUSTI_ASSERT_TIMEOUT: 60000
-  ARTIFACT_PREFIX: ${{ github.ref_name == 'prerelease' && 'prusti-prerelease' || 'prusti-release' }}
+  ARTIFACT_PREFIX: ${{ github.ref_name == 'pre-release' && 'prusti-prerelease' || 'prusti-release' }}
 
 jobs:
   # Build and test in release mode
