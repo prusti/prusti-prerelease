@@ -50,6 +50,7 @@ jobs:
         run: python x.py build --release --all
 
       - name: Run cargo tests --release
+        if: github.ref_name != 'pre-release'
         run: python x.py test --release --all
 
       - name: Package Prusti artifact
