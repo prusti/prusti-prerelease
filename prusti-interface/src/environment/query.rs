@@ -3,19 +3,19 @@ use std::fmt::Debug;
 use crate::data::ProcedureDefId;
 use log::debug;
 use prusti_rustc_interface::{
-    data_structures::fx::FxIndexSet,
     hir::{hir_id::HirId, Attribute},
-    infer::infer::{outlives::env::OutlivesEnvironment, InferCtxt},
-    middle::ty::{self, GenericArgsRef, ParamEnv, PredicatePolarity, TraitPredicate, TyCtxt},
+    infer::infer::InferCtxt,
+    middle::ty::{
+        self, GenericArgsRef, ParamEnv, PredicatePolarity, TraitPredicate, TyCtxt, TypeVisitableExt,
+    },
     span::{
-        def_id::{DefId, LocalDefId, CRATE_DEF_ID},
+        def_id::{DefId, LocalDefId},
         source_map::SourceMap,
         Span,
     },
     trait_selection::{
         infer::{InferCtxtExt, TyCtxtInferExt},
         traits::{
-            outlives_bounds::InferCtxtExt as BoundsInferCtxtExt,
             query::evaluate_obligation::InferCtxtExt as QueryInferCtxtExt, ImplSource, Obligation,
             ObligationCause, SelectionContext,
         },
@@ -175,40 +175,6 @@ impl<'tcx> EnvQuery<'tcx> {
         self.resolve_assoc_types(sig, caller_def_id.into_param())
     }
 
-    pub fn get_liberated_fn_sig(
-        self,
-        def_id: impl IntoParam<ProcedureDefId>,
-        substs: GenericArgsRef<'tcx>,
-    ) -> ty::FnSig<'tcx> {
-        let def_id = def_id.into_param();
-        let sig = self.get_fn_sig(def_id, substs);
-        self.tcx.liberate_late_bound_regions(def_id, sig)
-    }
-
-    pub fn assumed_wf_types(
-        self,
-        def_id: impl IntoParam<ProcedureDefId>,
-    ) -> FxIndexSet<ty::Ty<'tcx>> {
-        let def_id = def_id.into_param();
-        let liberated_sig = self.get_liberated_fn_sig(def_id, self.identity_substs(def_id));
-        // TODO: same as `ObligationCtxt::assumed_wf_types` but skips `deeply_normalize` step, is that fine?
-        liberated_sig
-            .inputs_and_output
-            .iter()
-            .collect::<FxIndexSet<_>>()
-    }
-
-    pub fn outlives_env(self, def_id: impl IntoParam<ProcedureDefId>) -> OutlivesEnvironment<'tcx> {
-        let def_id = def_id.into_param();
-        let wf_tys = self.assumed_wf_types(def_id);
-
-        let infcx = self.infer_ctxt();
-        let param_env = self.tcx.param_env(def_id);
-        // TODO: what value to use for `disable_implied_bounds_hack`?
-        let ib = infcx.implied_bounds_tys(CRATE_DEF_ID, param_env, wf_tys, true);
-        OutlivesEnvironment::from_normalized_bounds(param_env, vec![], ib, Default::default())
-    }
-
     /// Returns true iff `def_id` is a closure.
     pub fn is_closure(self, def_id: impl IntoParam<DefId>) -> bool {
         self.tcx.is_closure_like(def_id.into_param())
@@ -284,53 +250,111 @@ impl<'tcx> EnvQuery<'tcx> {
         Some((trait_method_def_id, trait_method_substs))
     }
 
+    /// Given some trait item `proc_def_id` which is called with `substs`
+    /// (under the caller's `typing_env`), returns the `DefId` of the trait
+    /// `impl` block that the call selects. Returns `None` if `proc_def_id` is
+    /// no trait item or selection does not yield a user-defined impl (e.g.
+    /// the `Self` type is generic).
+    #[tracing::instrument(level = "debug", skip(self, typing_env))]
+    pub fn find_trait_impl_of_method_call(
+        self,
+        typing_env: ty::TypingEnv<'tcx>,
+        proc_def_id: impl IntoParam<ProcedureDefId> + Debug,
+        substs: GenericArgsRef<'tcx>,
+    ) -> Option<DefId> {
+        let proc_def_id = proc_def_id.into_param();
+        let trait_id = self.get_trait_of_assoc(proc_def_id)?;
+        debug!(
+            "Fetching implementations of method '{:?}' defined in trait '{}' with substs '{:?}'",
+            proc_def_id,
+            self.tcx.def_path_str(trait_id),
+            substs
+        );
+        // Selection runs in a fresh inference context: region variables from
+        // the caller's context (e.g. borrowck'd MIR) do not affect which impl
+        // matches and must be erased, while type/const inference variables
+        // would be dangling indices - a caller bug.
+        assert!(
+            !substs.has_non_region_infer(),
+            "trait selection on substs with inference variables: {substs:?}"
+        );
+        let substs = self.tcx.erase_regions(substs);
+        let infcx = self.infer_ctxt();
+        let mut sc = SelectionContext::new(&infcx);
+        let trait_ref = ty::TraitRef::new(self.tcx, trait_id, substs);
+        let obligation = Obligation::new(
+            self.tcx,
+            ObligationCause::dummy(),
+            typing_env.param_env,
+            TraitPredicate {
+                trait_ref,
+                polarity: PredicatePolarity::Positive,
+            },
+        );
+        let result = sc.select(&obligation);
+        match result {
+            Ok(Some(ImplSource::UserDefined(data))) => Some(data.impl_def_id),
+            _ => None,
+        }
+    }
+
     /// Given some procedure `proc_def_id` which is called, this method returns the actual method which will be executed when `proc_def_id` is defined on a trait.
-    /// Returns `None` if this method can not be found or the provided `proc_def_id` is no trait item.
-    #[tracing::instrument(level = "debug", skip(self))]
+    /// Returns `None` if this method can not be found or the provided `proc_def_id` is no trait item. Returns `proc_def_id` if a default implementation is called.
+    #[tracing::instrument(level = "debug", skip(self, caller_def_id))]
     pub fn find_impl_of_trait_method_call(
         self,
+        caller_def_id: impl IntoParam<ProcedureDefId>, // where are we calling from?
         proc_def_id: impl IntoParam<ProcedureDefId> + Debug,
         substs: GenericArgsRef<'tcx>,
     ) -> Option<ProcedureDefId> {
-        // TODO(tymap): remove this method?
         let proc_def_id = proc_def_id.into_param();
-        if let Some(trait_id) = self.get_trait_of_assoc(proc_def_id) {
-            debug!("Fetching implementations of method '{:?}' defined in trait '{}' with substs '{:?}'", proc_def_id, self.tcx.def_path_str(trait_id), substs);
-            // TODO(tymap): don't use reveal_all
-            let typing_env = ty::TypingEnv::fully_monomorphized();
-            let infcx = self.infer_ctxt();
-            let mut sc = SelectionContext::new(&infcx);
-            let trait_ref = ty::TraitRef::new(self.tcx, trait_id, substs);
-            let obligation = Obligation::new(
-                self.tcx,
-                ObligationCause::dummy(),
-                typing_env.param_env,
-                TraitPredicate {
-                    trait_ref,
-                    polarity: PredicatePolarity::Positive,
-                },
-            );
-            let result = sc.select(&obligation);
-            match result {
-                Ok(Some(ImplSource::UserDefined(data))) => {
-                    for item in self
-                        .tcx
-                        .associated_items(data.impl_def_id)
-                        .in_definition_order()
-                    {
-                        if let Some(id) = item.trait_item_def_id {
-                            if id == proc_def_id {
-                                return Some(item.def_id);
-                            }
-                        }
-                    }
-                    unreachable!()
+        let typing_env = ty::TypingEnv::post_analysis(self.tcx, caller_def_id.into_param());
+        let impl_def_id = self.find_trait_impl_of_method_call(typing_env, proc_def_id, substs)?;
+        for item in self.tcx.associated_items(impl_def_id).in_definition_order() {
+            if let Some(id) = item.trait_item_def_id {
+                if id == proc_def_id {
+                    return Some(item.def_id);
                 }
-                _ => None,
             }
-        } else {
-            None
         }
+        if self
+            .tcx
+            .associated_item(proc_def_id)
+            .defaultness(self.tcx)
+            .has_value()
+        {
+            return Some(proc_def_id);
+        }
+        unreachable!()
+    }
+
+    /// Given the `called_def_id` of a function, called from `caller_def_id`,
+    /// and some substitutions `call_substs` applied for that call, returns
+    /// `true` if the call is to a function in the specified crate
+    /// `crate_name`. A trait method call is attributed to the crate of the
+    /// `impl` it relies on (e.g. `PartialOrd::le` on `Int` belongs to
+    /// `prusti_contracts`, even though the default `le` body lives in
+    /// `core`); other calls, and trait calls whose impl is unknown (e.g. a
+    /// generic `Self`), to the crate of the called definition itself.
+    pub fn is_function_in_crate(
+        self,
+        caller_def_id: impl IntoParam<ProcedureDefId>, // where are we calling from?
+        called_def_id: impl IntoParam<ProcedureDefId>, // what are we calling?
+        call_substs: GenericArgsRef<'tcx>,
+        crate_name: &'tcx str,
+    ) -> bool {
+        let called_def_id = called_def_id.into_param();
+        let typing_env = ty::TypingEnv::post_analysis(self.tcx, caller_def_id.into_param());
+        let def_id = self
+            .find_trait_impl_of_method_call(typing_env, called_def_id, call_substs)
+            .unwrap_or(called_def_id);
+        self.tcx.crate_name(def_id.krate).as_str() == crate_name
+    }
+
+    /// Given an adt definition (adt), this method returns if the adt is defined in the crate specified (crate_name)
+    pub fn is_adt_in_crate(self, adt: ty::AdtDef<'tcx>, crate_name: &'tcx str) -> bool {
+        let did_crate_name = self.tcx.crate_name(adt.did().krate);
+        did_crate_name.as_str() == crate_name
     }
 
     /// Given a call to `called_def_id` from within `caller_def_id`, returns

@@ -49,6 +49,7 @@ impl<'vir, P: PurityCasters> task_encoder::OutputRefAny for GArgCasters<'vir, P>
 
 impl TaskEncoder for CastersEnc<Pure> {
     task_encoder::encoder_cache!(CastersEnc<Pure>);
+    const ENCODER_NAME: &'static str = "pure casters encoder";
 
     type TaskDescription<'vir> = (RustTy<'vir>, RustTy<'vir>);
     type OutputRef<'vir> = GArgCasters<'vir, Pure>;
@@ -70,7 +71,8 @@ impl TaskEncoder for CastersEnc<Pure> {
             let domain_ref = deps.require_ref::<TyPureEnc>(concrete)?;
             let generic_snap = vir::TYPE_PSNAP;
             let generic_typeof = deps.require_ref::<TypeOfEnc>(param)?.typeof_function;
-            let self_ty = (domain_ref.domain)().downcast_ty();
+            let concrete_typeof = deps.require_ref::<TypeOfEnc>(concrete)?.typeof_function;
+            let self_ty = domain_ref.snapshot.downcast_ty();
             let base_name = concrete.name();
             let ty_constructor = deps.require_ref::<TyConstructorEnc>(concrete)?;
             let generics = deps.require_dep::<GenericParamsEnc>(concrete.params)?;
@@ -104,14 +106,18 @@ impl TaskEncoder for CastersEnc<Pure> {
                 .ty_decls()
                 .iter()
                 .enumerate()
-                .map(|(idx, _)| ty_constructor.ty_param_from_snap(idx, make_generic_expr))
+                .map(|(idx, _)| {
+                    ty_constructor.ty_param_from_snap(idx, concrete_typeof, make_generic_expr)
+                })
                 .collect::<Vec<_>>();
 
             let const_params_from_snap = generics
                 .const_decls()
                 .iter()
                 .enumerate()
-                .map(|(idx, _)| ty_constructor.const_param_from_snap(idx, make_generic_expr))
+                .map(|(idx, _)| {
+                    ty_constructor.const_param_from_snap(idx, concrete_typeof, make_generic_expr)
+                })
                 .collect::<Vec<_>>();
 
             // Asserts that the type of `param` is equal to the ty constructor
@@ -169,6 +175,22 @@ impl TaskEncoder for CastersEnc<Pure> {
                 make_concrete_snap_arg_expr,
             );
 
+            let mut make_concrete_posts = vec![make_concrete_post];
+            // A zero-field struct has a single value, so `make_concrete`
+            // returns it; this merges otherwise-distinct unit terms (e.g. the
+            // thin pointer metadata read out of a reference's snapshot with
+            // the freshly constructed one).
+            if concrete
+                .get_structlike()
+                .is_some_and(|data| data.fields.is_empty())
+            {
+                let cons = deps
+                    .require_dep::<TyPureEnc>(concrete)?
+                    .expect_structlike()
+                    .field_snaps_to_snap;
+                make_concrete_posts.push(vcx.mk_eq_expr(vcx.mk_result(self_ty), cons.call()(&[])));
+            }
+
             let make_concrete = vcx.mk_function(
                 make_concrete_ident,
                 (
@@ -179,7 +201,7 @@ impl TaskEncoder for CastersEnc<Pure> {
                 // TODO: type preconditions do not currently work
                 // vcx.alloc_slice(&[make_concrete_pre]),
                 &[],
-                vcx.alloc_slice(&[make_concrete_post]),
+                vcx.alloc_slice(&make_concrete_posts),
                 None,
                 None,
             );
@@ -189,7 +211,7 @@ impl TaskEncoder for CastersEnc<Pure> {
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        for output in Self::all_outputs_local_no_errors() {
+        for output in Self::all_outputs_local_no_errors(program) {
             for function in output {
                 program.add_function(function);
             }
@@ -199,6 +221,7 @@ impl TaskEncoder for CastersEnc<Pure> {
 
 impl TaskEncoder for CastersEnc<Impure> {
     task_encoder::encoder_cache!(CastersEnc<Impure>);
+    const ENCODER_NAME: &'static str = "impure casters encoder";
 
     type TaskDescription<'vir> = (RustTy<'vir>, RustTy<'vir>);
     type OutputRef<'vir> = GArgCasters<'vir, Impure>;
@@ -245,8 +268,8 @@ impl TaskEncoder for CastersEnc<Impure> {
             let self_expr = vcx.mk_local_ex(self_decl);
             let decls = (self_decl, generics.ty_decls(), generics.const_decls());
 
-            let predicate_ref = deps.require_dep::<TyImpureEnc>(concrete)?;
-            let generic_ref = deps.require_dep::<TyImpureEnc>(param)?;
+            let predicate_ref = deps.require_ref::<TyImpureEnc>(concrete)?;
+            let generic_ref = deps.require_ref::<TyImpureEnc>(param)?;
 
             let concrete_predicate = (predicate_ref.ref_to_pred)(
                 self_expr,
@@ -307,7 +330,7 @@ impl TaskEncoder for CastersEnc<Impure> {
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        for output in Self::all_outputs_local_no_errors() {
+        for output in Self::all_outputs_local_no_errors(program) {
             for method in output {
                 program.add_method(method);
             }

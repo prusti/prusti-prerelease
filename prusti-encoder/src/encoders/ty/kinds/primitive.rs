@@ -3,30 +3,34 @@ use crate::encoders::ty::{
     impure::{PredicateBuilder, TyImpureEnc, TyImpurePrimitive},
     interpretation::float::ty_pure_float,
     pure::{
-        DomainBuilder, TyPureEnc, TyPurePrimData, TyPurePrimDataKind, TyPurePrimDataNative,
+        TyPureBuilder, TyPureEnc, TyPurePrimData, TyPurePrimDataInt, TyPurePrimDataKind,
         TyPurePrimitive,
     },
 };
 use prusti_rustc_interface::middle::ty;
 use task_encoder::{EncodeFullError, TaskEncoderDependencies};
-use vir::{CastType, HasType, VirCtxt};
+use vir::{CastType, VirCtxt};
 
 pub(crate) fn ty_pure<'vir>(
     vcx: &'vir VirCtxt<'vir>,
     data: &RustPrimitive<'vir>,
     deps: &mut TaskEncoderDependencies<'vir, TyPureEnc>,
-    builder: &mut DomainBuilder<'vir>,
+    builder: &mut TyPureBuilder<'vir>,
 ) -> Result<TyPurePrimitive<'vir>, EncodeFullError<'vir, TyPureEnc>> {
     let ty = data;
     let ty_kind = ty.kind();
 
-    let prim_type: vir::TypePrim<'vir> = match ty_kind {
-        ty::TyKind::Bool => vir::TYPE_BOOL.upcast_ty(),
-        ty::TyKind::Char | ty::TyKind::Int(_) | ty::TyKind::Uint(_) => vir::TYPE_INT.upcast_ty(),
-        ty::TyKind::Float(_) => vir::TYPE_INT.upcast_ty(),
-        _ => unreachable!(),
-    };
+    if matches!(ty_kind, ty::TyKind::Bool) {
+        // Represented directly by the native Viper `Bool` type (see
+        // `TyPureBuilder::new`): the primitive and the snapshot coincide, so
+        // the conversions are casts and there is nothing to emit.
+        return Ok(TyPurePrimData {
+            kind: TyPurePrimDataKind::Bool,
+        });
+    }
+    let builder = builder.set_domain_builder();
 
+    let prim_type = vir::TYPE_INT.upcast_ty();
     let cons_ident = builder.function("cons", prim_type, builder.self_type());
 
     let kind = match ty_kind {
@@ -34,7 +38,7 @@ pub(crate) fn ty_pure<'vir>(
             let data = ty_pure_float(vcx, deps, builder, *float, cons_ident)?;
             TyPurePrimDataKind::Float(vcx.alloc(data))
         }
-        _ => {
+        ty::TyKind::Char | ty::TyKind::Int(_) | ty::TyKind::Uint(_) => {
             let value_ident = builder.function("value", builder.self_type(), prim_type);
 
             builder.axiom("cons", vir::expr! {
@@ -63,16 +67,14 @@ pub(crate) fn ty_pure<'vir>(
                     });
                 }
             };
-            TyPurePrimDataKind::Native(TyPurePrimDataNative {
+            TyPurePrimDataKind::Int(TyPurePrimDataInt {
+                prim_to_snap: cons_ident,
                 snap_to_prim: value_ident,
             })
         }
+        _ => unreachable!(),
     };
-    Ok(TyPurePrimData {
-        prim_type,
-        prim_to_snap: cons_ident,
-        kind,
-    })
+    Ok(TyPurePrimData { kind })
 }
 
 pub(crate) fn ty_impure<'vir>(
@@ -80,9 +82,12 @@ pub(crate) fn ty_impure<'vir>(
     _deps: &mut TaskEncoderDependencies<'vir, TyImpureEnc>,
     builder: &mut PredicateBuilder<'vir>,
 ) -> Result<TyImpurePrimitive<'vir>, EncodeFullError<'vir, TyImpureEnc>> {
-    // let ty = data.ty();
-    // let ty_kind = ty.kind();
+    set_primitive(builder);
+    Ok(())
+}
 
+/// A predicate holding a single `val` field with the snapshot value.
+pub(super) fn set_primitive<'vir>(builder: &mut PredicateBuilder<'vir>) {
     let snap_type = builder.csnap_type();
 
     let ref_self_decl = builder.ref_self_decl();
@@ -92,29 +97,8 @@ pub(crate) fn ty_impure<'vir>(
     let prim_field = builder.field("val", snap_type);
 
     // main predicate
-    let self_pred = builder.predicate::<vir::Ref>(
-        "",
-        ref_self_decl.ty(),
-        (ref_self_decl,),
-        Some(vir::expr! { acc((ref_self).[prim_field]) }),
-    );
+    builder.mk_predicate("", Some(vir::expr! { acc((ref_self).[prim_field]) }));
 
     // Ref-to-snap
-    builder.function_snap = Some(
-        builder
-            .mk_function::<vir::Ref, _>(
-                "snap",
-                ref_self_decl.ty(),
-                snap_type,
-                (ref_self_decl,),
-                &[vir::expr! { acc([self_pred](ref_self)) }],
-                &[],
-                Some(vir::expr! {
-                    unfolding ([self_pred](ref_self)) in ([prim_field](ref_self))
-                }),
-            )
-            .1,
-    );
-
-    Ok(())
+    builder.mk_snap_function(Some(vir::expr! { [prim_field](ref_self) }));
 }

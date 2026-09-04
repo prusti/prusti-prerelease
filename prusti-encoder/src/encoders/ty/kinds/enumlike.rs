@@ -10,6 +10,7 @@ use crate::encoders::{
             ImpureTyDatas, PredicateBuilder, TyImpureEnc, TyImpureEnumData, TyImpureVariantData,
         },
         pure::{AdtBuilder, PureTyDatas, TyPureEnc, TyPureEnumData, TyPureVariantData},
+        use_inhabited::TyUseInhabitedEnc,
     },
 };
 
@@ -22,7 +23,7 @@ pub(crate) fn ty_pure<'vir>(
     let discr_ty =
         deps.require_dep::<TyPureEnc>(RustTyDecomposition::from_prim_ty(data.discr).ty)?;
     let discr_prim = discr_ty.expect_primitive();
-    let discr_ty = (discr_ty.domain)();
+    let discr_ty = discr_ty.snapshot;
 
     let variants = data
         .variants
@@ -30,7 +31,7 @@ pub(crate) fn ty_pure<'vir>(
         .map(|variant| {
             let var_idx_num = variant.vid.as_u32();
             let discr =
-                (discr_prim.prim_to_snap)(discr_prim.expr_from_bits(data.discr, variant.discr_val));
+                discr_prim.prim_to_snap(discr_prim.expr_from_bits(data.discr, variant.discr_val));
 
             let specifics = super::structlike::ty_pure_variant(
                 &format!("{var_idx_num}_"),
@@ -41,11 +42,7 @@ pub(crate) fn ty_pure<'vir>(
                 builder,
             )?;
 
-            Ok(VariantData::new(
-                TyPureVariantData { discr },
-                variant.inhabited,
-                specifics,
-            ))
+            Ok(VariantData::new(TyPureVariantData { discr }, specifics))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -58,7 +55,6 @@ pub(crate) fn ty_pure<'vir>(
             discr_prim: *discr_prim,
             snap_to_discr_snap,
         },
-        data.inhabited,
         variants,
     ))
 }
@@ -95,21 +91,35 @@ pub(crate) fn ty_impure<'vir>(
         .map(|variant| {
             let var_idx_num = variant.0.vid.as_u32();
 
-            let (
-                inner,
-                variant_pred,
-                variant_snap_expr,
-            ) = super::structlike::ty_impure_variant(
+            let (inner, variant_pred, variant_snap_expr) =
+                super::structlike::ty_impure_variant(
                 &format!("{var_idx_num}_"),
                 task_key,
                 &variant.inner,
                 deps,
                 builder,
             )?;
+            let variant_inhabited = builder.vcx.mk_conj(
+                &variant
+                    .inner
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        let ty = field.0.ty().decompose(task_key.0.params);
+                        Ok(deps
+                            .require_ref::<TyUseInhabitedEnc>(ty)?
+                            .inhabited())
+                    })
+                    .collect::<Result<Vec<_>, EncodeFullError<'vir, TyImpureEnc>>>()?,
+            );
 
             let variant_pred_expr = vir::expr! {
                 (([snap_disc])
-                    == ([variant.1.discr])) ==> ([variant_pred](ref_self, [..[builder.params.ty_exprs()]], [..[builder.params.const_exprs()]]))
+                    == ([variant.1.discr])) ==> (([variant_inhabited])
+                        && ([variant_pred](ref_self, [..[builder.params.ty_exprs()]], [..[builder.params.const_exprs()]])))
+            };
+            let variant_snap_expr = vir::expr! {
+                unfolding ([variant_pred](ref_self, [..[builder.params.ty_exprs()]], [..[builder.params.const_exprs()]])) in (variant_snap_expr)
             };
 
             Ok((
@@ -118,7 +128,7 @@ pub(crate) fn ty_impure<'vir>(
                 variant.1.discr,
                 VariantData::new(TyImpureVariantData {
                     predicate: variant_pred,
-                }, variant.inhabited, inner)
+                }, inner)
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -134,52 +144,33 @@ pub(crate) fn ty_impure<'vir>(
     let variant_predicates = builder
         .vcx
         .mk_conj(&variants.iter().map(|v| v.1).collect::<Vec<_>>());
-    let self_pred = builder
-        .inner
-        .predicate::<(vir::Ref, vir::ManyTyVal, vir::ManyCSnap)>(
-            "",
-            (
-                ref_self_decl.ty,
-                builder.params.ty_args(),
-                builder.params.const_args(),
-            ),
-            (
-                ref_self_decl,
-                builder.params.ty_decls(),
-                builder.params.const_decls(),
-            ),
-            Some(vir::expr! {
-                ([variant_predicate])
-                && (([variant_values])
-                && ([variant_predicates]))
-            }),
-        );
+    builder.mk_predicate(
+        "",
+        Some(vir::expr! {
+            ([variant_predicate])
+            && (([variant_values])
+            && ([variant_predicates]))
+        }),
+    );
 
     // Ref-to-snap
-    builder.function_snap = Some(builder.mk_function::<(vir::Ref, vir::ManyTyVal, vir::ManyCSnap), _>(
-        "snap",
-        (ref_self_decl.ty,
-            builder.params.ty_args(), builder.params.const_args()),
-        builder.csnap_type(),
-        (ref_self_decl, builder.params.ty_decls(), builder.params.const_decls()),
-        &[vir::expr! { acc([self_pred](ref_self, [..[builder.params.ty_exprs()]], [..[builder.params.const_exprs()]])) }],
-        &[],
-        Some(vir::expr! {
-            unfolding ([self_pred](ref_self, [..[builder.params.ty_exprs()]], [..[builder.params.const_exprs()]])) in ([variants.iter()
-                .fold((task_key.1.unreachable_to_snap)(builder.params.ty_exprs()).downcast_ty(), |else_, variant| builder.vcx.mk_ternary_expr(
-                    vir::expr! { ([snap_disc]) == ([variant.2]) },
-                    variant.0,
-                    else_,
-                ))])
-        }),
-    ).1);
+    let base =
+        (task_key.1.unreachable_to_snap)(builder.params.ty_exprs(), builder.params.const_exprs())
+            .downcast_ty();
+    let inner = variants.iter().fold(base, |else_, variant| {
+        builder.vcx.mk_ternary_expr(
+            vir::expr! { ([snap_disc]) == ([variant.2]) },
+            variant.0,
+            else_,
+        )
+    });
+    builder.mk_snap_function(Some(inner));
 
     Ok(EnumData::new(
         TyImpureEnumData {
             discr: fdisc_func,
             discr_ty: discr_ty_impure,
         },
-        data.inhabited,
         variants.into_iter().map(|v| v.3).collect::<Vec<_>>(),
     ))
 }

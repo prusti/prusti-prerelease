@@ -11,6 +11,8 @@ pub type FloatDomain<'vir> = &'vir FloatDomainData<'vir>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FloatDomainData<'vir> {
+    /// Viper primitive value (the raw bits) as argument. Returns domain.
+    pub prim_to_snap: FunctionIdn<'vir, vir::Prim, vir::CSnap>,
     #[allow(unused)]
     pub from_bv: FunctionIdn<'vir, vir::CSnap, vir::CSnap>,
     pub fp_eq: FunctionIdn<'vir, (vir::CSnap, vir::CSnap), vir::Bool>,
@@ -27,6 +29,7 @@ pub struct FloatDomainData<'vir> {
     pub fp_geq: FunctionIdn<'vir, (vir::CSnap, vir::CSnap), vir::Bool>,
     pub fp_neg: FunctionIdn<'vir, vir::CSnap, vir::CSnap>,
     pub fp_abs: FunctionIdn<'vir, vir::CSnap, vir::CSnap>,
+    pub fp_to_real: FunctionIdn<'vir, vir::CSnap, vir::Perm>,
 }
 
 pub(crate) fn ty_pure_float<'vir>(
@@ -189,11 +192,19 @@ pub(crate) fn ty_pure_float<'vir>(
     };
     let from_bv = builder.backend_func("from_bv", (bit_vec.domain)(), builder.self_type(), Some(i));
 
+    let fp_to_real = builder.backend_func(
+        "to_real",
+        builder.self_type(),
+        vir::TYPE_PERM,
+        Some("fp.to_real"),
+    );
+
     builder.axiom("prim_to_snap", vir::expr! {
-        forall i: [prim_to_snap.arity()] :: {[prim_to_snap](i)} ([prim_to_snap(i)]) == ([from_bv]([bit_vec.from_int](i)))
+        forall i: [prim_to_snap.arity()] :: {[prim_to_snap](i)} (([prim_to_snap](i)) == ([from_bv]([bit_vec.from_int](i)))) && (([fp_to_real]([prim_to_snap](i))) == ([fp_to_real]([from_bv]([bit_vec.from_int](i)))))
     });
 
     Ok(FloatDomainData {
+        prim_to_snap,
         from_bv,
         fp_eq,
         fp_add,
@@ -209,5 +220,6 @@ pub(crate) fn ty_pure_float<'vir>(
         fp_geq,
         fp_neg,
         fp_abs,
+        fp_to_real,
     })
 }

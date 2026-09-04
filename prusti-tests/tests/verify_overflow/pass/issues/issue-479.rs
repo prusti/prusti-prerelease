@@ -4,6 +4,7 @@ use std::hash::{Hash, BuildHasher};
 
 #[extern_spec]
 impl<K, V, S> HashMap<K, V, S> {
+    #[trusted]
     #[pure]
     fn len(&self) -> usize;
 }
@@ -14,7 +15,8 @@ where
     K: Eq + Hash,
     S: BuildHasher,
 {
-    #[ensures(snapshot_equality(result, None) ==> self.len() == old(self.len()) + 1)]
+    #[trusted]
+    #[ensures(result === None ==> self.len() == old(self.len()) + 1)]
     fn insert(&mut self, key: K, value: V) -> Option<V>;
 }
 

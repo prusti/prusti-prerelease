@@ -3,32 +3,30 @@
 """A wrapper for cargo that sets up the Prusti environment."""
 
 import sys
+# NOTE: requires a minimum of Python 3.8 to run
+
 if sys.version_info[0] < 3:
     print('You need to run this script with Python 3.')
+    sys.exit(1)
+
+if sys.version_info[1] < 8: # needed to support trailing = in f-strings
+    print('You need to run this script with Python 3.8 or above.')
     sys.exit(1)
 
 import os
 import platform
 import subprocess
 import glob
-import csv
 import logging
 from pathlib import Path
-import time
-import json
-import signal
 import shutil
-import traceback
-import datetime
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'scripts'))
 import reporting
-from reporting import (
-    report, error
-)
+from reporting import error
 import benchmark
 from helper_functions import (
-    get_env, run_command, extract_test_compile_flags
+    get_env, run_command
 )
 import verify_test
 
@@ -208,8 +206,21 @@ def fmt_all():
         fmt_in(crate)
 
 def fmt_check_in(cwd):
-    """Run cargo fmt check in the given subproject."""
-    run_command(['cargo', 'fmt', '--', '--check'], cwd=cwd)
+    """Run cargo fmt check in the given subproject, failing on any error.
+
+    Errors which rustfmt reports without failing itself are how it says that
+    it could not format something, e.g. that formatting a construct would drop
+    one of its comments and that it therefore left the entire enclosing
+    expression (and thus all of the code within it) exactly as it found it.
+    """
+    completed = run_command(['cargo', 'fmt', '--', '--check'], cwd=cwd,
+                            capture_output=True)
+    stderr = completed.stderr.decode()
+    sys.stdout.write(completed.stdout.decode())
+    sys.stderr.write(stderr)
+    # e.g. `error[internal]: not formatted because a comment would be lost`
+    if any(line.startswith('error') for line in stderr.splitlines()):
+        error('rustfmt reported errors in {}, see above.', cwd)
 
 def fmt_check_all():
     """Run rustfmt check on all formatted files."""

@@ -2,13 +2,30 @@ use super::*;
 
 pub enum TaskEncoderCacheState<'vir, E: TaskEncoder + 'vir + ?Sized> {
     // None, // indicated by absence in the cache
-    /// Task was enqueued but not yet started.
-    Enqueued,
+    /// Task's encoding is running but has not yet emitted an output
+    /// reference. Requesting the task re-runs the encoding (see `Started`).
+    Encoding,
+
+    /// Task is being re-encoded while its first encoding (which has not yet
+    /// emitted an output reference, see `Encoding`) is suspended. Requesting
+    /// the task in this state is a cyclic dependency error: a third run
+    /// would only repeat the re-run's requests.
+    ReEncoding,
 
     /// Task is currently being encoded. The output reference is available.
-    /// Full encoding is not available yet, and querying for it indicates
-    /// a cyclic dependency error.
+    /// Full encoding is not available yet: querying for it re-runs the
+    /// encoding, which succeeds when the re-run makes progress (e.g. because
+    /// its dependencies now find this task's output reference or the outputs
+    /// cached by the first run), in which case the earlier run adopts its
+    /// result (`EncodeFullError::AlreadyEncoded`).
     Started {
+        output_ref: <E as TaskEncoder>::OutputRef<'vir>,
+    },
+
+    /// Task is being re-encoded while its first encoding is suspended (see
+    /// `Started`). Requesting the task in this state is a cyclic dependency
+    /// error: a third run would only repeat the re-run's requests.
+    Restarted {
         output_ref: <E as TaskEncoder>::OutputRef<'vir>,
     },
 
@@ -22,7 +39,10 @@ pub enum TaskEncoderCacheState<'vir, E: TaskEncoder + 'vir + ?Sized> {
     },
 
     /// An error occurred when enqueing the task.
-    ErrorEnqueue { error: TaskEncoderError<E> },
+    ErrorEnqueue {
+        error: TaskEncoderError<E>,
+        spans: Vec<Span>,
+    },
 
     /// An error occurred when encoding the task. The full "local" encoding is
     /// not available. However, tasks which depend on this task may still
@@ -35,17 +55,18 @@ pub enum TaskEncoderCacheState<'vir, E: TaskEncoder + 'vir + ?Sized> {
         deps: TaskEncoderDependencies<'vir, E>,
         error: TaskEncoderError<E>,
         output_dep: Option<<E as TaskEncoder>::OutputFullDependency<'vir>>,
+        spans: Vec<Span>,
     },
 }
 
 /// Cache for a task encoder. See `TaskEncoderCacheState` for a description of
 /// the possible values in the encoding process.
 pub type Cache<'vir, E> =
-    LinkedHashMap<<E as TaskEncoder>::TaskKey<'vir>, TaskEncoderCacheState<'vir, E>>;
+    FxIndexMap<<E as TaskEncoder>::TaskKey<'vir>, TaskEncoderCacheState<'vir, E>>;
 pub type CacheRef<'vir, E> = RefCell<Cache<'vir, E>>;
 
 pub type CacheStatic<E> =
-    LinkedHashMap<<E as TaskEncoder>::TaskKey<'static>, TaskEncoderCacheState<'static, E>>;
+    FxIndexMap<<E as TaskEncoder>::TaskKey<'static>, TaskEncoderCacheState<'static, E>>;
 pub type CacheStaticRef<E> = RefCell<CacheStatic<E>>;
 
 /// Create the cache storage (a static `RefCell`) and a `with_cache`
@@ -73,6 +94,19 @@ macro_rules! encoder_cache {
                 //   the rustc type context, respectively
                 let cache = unsafe { ::std::mem::transmute(cache) };
                 f(cache)
+            })
+        }
+
+        fn with_watchers<'vir, F, R>(f: F) -> R
+            where F: FnOnce(&'vir $crate::WatchersRef<'vir, $encoder>) -> R,
+        {
+            ::std::thread_local! {
+                static WATCHERS: $crate::WatchersStaticRef<$encoder> = ::std::cell::RefCell::new(Default::default());
+            }
+            WATCHERS.with(|watchers| {
+                // SAFETY: as for the cache above
+                let watchers = unsafe { ::std::mem::transmute(watchers) };
+                f(watchers)
             })
         }
     };

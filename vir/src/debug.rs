@@ -66,10 +66,11 @@ impl<'vir, Curr, Next> Debug for BinOpGenData<'vir, Curr, Next> {
                 BinOpKind::Sub => "-",
                 BinOpKind::Mul => "*",
                 BinOpKind::Div => "\\",
-                BinOpKind::DivRational => "/",
+                BinOpKind::PermAdd => "+",
+                BinOpKind::PermSub => "-",
+                BinOpKind::PermMul => "*",
+                BinOpKind::PermPermDiv => "/",
                 BinOpKind::Mod => "%",
-                BinOpKind::SetUnion => "union",
-                BinOpKind::SetIn => "in",
             }
         )?;
         self.rhs.fmt(f)?;
@@ -77,7 +78,30 @@ impl<'vir, Curr, Next> Debug for BinOpGenData<'vir, Curr, Next> {
     }
 }
 
-impl Debug for CfgBlockLabelData {
+impl<'vir, Curr, Next> Debug for CollectionBinOpGenData<'vir, Curr, Next> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        let infix = match self.kind {
+            CollectionBinOpKind::Index => {
+                return write!(f, "{:?}[{:?}]", self.lhs, self.rhs);
+            }
+            CollectionBinOpKind::Take => {
+                return write!(f, "{:?}[..{:?}]", self.lhs, self.rhs);
+            }
+            CollectionBinOpKind::Drop => {
+                return write!(f, "{:?}[{:?}..]", self.lhs, self.rhs);
+            }
+            CollectionBinOpKind::Contains => "in",
+            CollectionBinOpKind::Union => "union",
+            CollectionBinOpKind::Intersection => "intersection",
+            CollectionBinOpKind::Difference => "setminus",
+            CollectionBinOpKind::Subset => "subset",
+            CollectionBinOpKind::Concat => "++",
+        };
+        write!(f, "({:?} {infix} {:?})", self.lhs, self.rhs)
+    }
+}
+
+impl<'vir> Debug for CfgBlockLabelData<'vir> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.name())
     }
@@ -176,14 +200,20 @@ impl<'vir, Curr, Next> Debug for ExprKindGenData<'vir, Curr, Next> {
         match self {
             Self::AccField(e) => e.fmt(f),
             Self::BinOp(e) => e.fmt(f),
+            Self::CollectionBinOp(e) => e.fmt(f),
             Self::Const(e) => e.fmt(f),
             Self::Result(_) => write!(f, "result"),
             Self::Field(e, field) => write!(f, "{:?}.{}", e, field.name),
             Self::Forall(e) => e.fmt(f),
             Self::Exists(e) => e.fmt(f),
-            Self::SetLiteral(e) => e.fmt(f),
+            Self::CollectionLiteral(e) => e.fmt(f),
+            Self::CollectionUpdate(e) => write!(f, "{:?}[{:?} := {:?}]", e.target, e.key, e.val),
+            Self::CollectionLen(e) => write!(f, "|{e:?}|"),
+            Self::MapDomain(e) => write!(f, "domain({e:?})"),
+            Self::MapRange(e) => write!(f, "range({e:?})"),
             Self::FuncApp(e) => e.fmt(f),
             Self::Let(e) => e.fmt(f),
+            Self::InhaleExhale(e) => write!(f, "[{:?}, {:?}]", e.inhale, e.exhale),
             Self::Lazy(e) => write!(f, "%%/*{}*/", e.name),
             Self::Local(e) => e.fmt(f),
             Self::Old(e) => e.fmt(f),
@@ -229,18 +259,21 @@ impl<'vir, Curr, Next> Debug for ExistsGenData<'vir, Curr, Next> {
     }
 }
 
-impl<'vir, Curr, Next> Debug for SetLiteralGenData<'vir, Curr, Next> {
+impl<'vir, Curr, Next> Debug for CollectionLiteralGenData<'vir, Curr, Next> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         if self.values.is_empty() {
-            write!(f, "(")?;
+            // The empty literal names its full type, e.g. `Seq[Int]()`.
+            return write!(f, "{:?}()", self.ty);
         }
-        write!(f, "Set(")?;
+        let name = match self.ty.kind() {
+            TypeKind::Seq(_) => "Seq",
+            TypeKind::Map(..) => "Map",
+            TypeKind::Multiset(_) => "Multiset",
+            _ => "Set",
+        };
+        write!(f, "{name}(")?;
         fmt_comma_sep(f, self.values)?;
-        write!(f, ")")?;
-        if self.values.is_empty() {
-            write!(f, ": {:?})", self.ty)?;
-        }
-        Ok(())
+        write!(f, ")")
     }
 }
 
@@ -335,7 +368,7 @@ impl<'vir, Curr, Next> Debug for MethodGenData<'vir, Curr, Next> {
 impl<'vir, Curr, Next> Debug for OldGenData<'vir, Curr, Next> {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "old")?;
-        match self.label {
+        match &self.label {
             OldLabel::None => (),
             OldLabel::Lhs => write!(f, "[lhs]")?,
             OldLabel::Block(block) => block.fmt(f)?,
@@ -398,6 +431,7 @@ impl<'vir, Curr, Next> Debug for StmtKindGenData<'vir, Curr, Next> {
             Self::PureAssign(data) => write!(f, "{:indent$?} := {:indent$?}", data.lhs, data.rhs),
             Self::Inhale(data) => write!(f, "inhale {data:indent$?}"),
             Self::Exhale(data) => write!(f, "exhale {data:indent$?}"),
+            Self::Refute(data) => write!(f, "refute {data:indent$?}"),
             Self::Unfold(data) => write!(f, "unfold {data:indent$?}"),
             Self::Fold(data) => write!(f, "fold {data:indent$?}"),
             Self::Package(wand, stmts) => {
@@ -428,10 +462,12 @@ impl<'vir, Curr, Next> Debug for StmtKindGenData<'vir, Curr, Next> {
                     writeln!(f, "  {stmt:indent$?}")?;
                     f.pad("")?;
                 }
-                writeln!(f, "}} else {{")?;
-                for stmt in els.iter() {
-                    writeln!(f, "  {stmt:indent$?}")?;
-                    f.pad("")?;
+                if !els.is_empty() {
+                    writeln!(f, "}} else {{")?;
+                    for stmt in els.iter() {
+                        writeln!(f, "  {stmt:indent$?}")?;
+                        f.pad("")?;
+                    }
                 }
                 write!(f, "}}")
             }
@@ -473,9 +509,9 @@ impl<'vir, Curr, Next> Debug for TerminatorStmtGenData<'vir, Curr, Next> {
                         }
                         writeln!(f, "  goto {:?}", target.label)?;
                         f.pad("")?;
-                        write!(f, "}} else ")?;
+                        write!(f, "}} else")?;
                     }
-                    writeln!(f, "{{")?;
+                    writeln!(f, " {{")?;
                     let indent = indent + 2;
                     for extra in data.otherwise_statements {
                         writeln!(f, "  {extra:indent$?}")?;
@@ -487,7 +523,11 @@ impl<'vir, Curr, Next> Debug for TerminatorStmtGenData<'vir, Curr, Next> {
                 }
             }
             Self::Exit => write!(f, "// return"),
-            Self::Dummy(info) => write!(f, "assert false // {info}"),
+            Self::Dummy(info) => {
+                writeln!(f, "assert false // {info}")?;
+                f.pad("")?;
+                write!(f, "{:?}", Self::Goto(&CfgBlockLabelData::End))
+            }
         }
     }
 }
@@ -536,6 +576,9 @@ impl<'vir> Debug for TypeKind<'vir> {
             Self::Ref => write!(f, "Ref"),
             Self::Perm => write!(f, "Perm"),
             Self::Set(ty) => write!(f, "Set[{ty:?}]"),
+            Self::Multiset(ty) => write!(f, "Multiset[{ty:?}]"),
+            Self::Seq(ty) => write!(f, "Seq[{ty:?}]"),
+            Self::Map(key, val) => write!(f, "Map[{key:?}, {val:?}]"),
             Self::Unsupported(u) => u.fmt(f),
             Self::Err => write!(f, "Err"),
         }
@@ -561,6 +604,7 @@ impl<'vir, Curr, Next> Debug for UnOpGenData<'vir, Curr, Next> {
             "{}({:?})",
             match self.kind {
                 UnOpKind::Neg => "-",
+                UnOpKind::PermNeg => "-",
                 UnOpKind::Not => "!",
             },
             self.expr

@@ -34,17 +34,87 @@ impl<'vir, Curr, Next> BinOpGenData<'vir, Curr, Next> {
             | BinOpKind::CmpGt
             | BinOpKind::CmpLt
             | BinOpKind::CmpGe
-            | BinOpKind::CmpLe
-            | BinOpKind::SetIn => crate::TYPE_BOOL.upcast_ty(),
+            | BinOpKind::CmpLe => crate::TYPE_BOOL.upcast_ty(),
             BinOpKind::And | BinOpKind::Or | BinOpKind::Implies => crate::TYPE_BOOL.upcast_ty(),
             BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul | BinOpKind::Div | BinOpKind::Mod => {
-                self.lhs.ty().downcast_ty()
+                crate::TYPE_INT.upcast_ty()
             }
-            BinOpKind::DivRational => crate::TYPE_PERM.upcast_ty(),
-
-            BinOpKind::SetUnion => return self.lhs.ty(),
+            BinOpKind::PermAdd
+            | BinOpKind::PermSub
+            | BinOpKind::PermMul
+            | BinOpKind::PermPermDiv => crate::TYPE_PERM.upcast_ty(),
         };
         ty.as_dyn()
+    }
+}
+
+/// A binary operation on a native Viper collection (see
+/// [`CollectionBinOpKind`]). The collection operand determines the exact
+/// operation and the result type.
+#[derive(VirHash, VirReify, VirSerde)]
+pub struct CollectionBinOpGenData<'vir, Curr, Next> {
+    #[vir(reify_pass)]
+    pub kind: CollectionBinOpKind,
+    pub lhs: ExprGenDyn<'vir, Curr, Next>,
+    pub rhs: ExprGenDyn<'vir, Curr, Next>,
+}
+
+impl<'vir, Curr, Next> CollectionBinOpGenData<'vir, Curr, Next> {
+    pub fn ty(&self) -> TypeDyn<'vir> {
+        match self.kind {
+            CollectionBinOpKind::Contains => match self.rhs.ty().kind() {
+                TypeKind::Multiset(_) => crate::TYPE_INT.as_dyn(),
+                TypeKind::Set(_) | TypeKind::Seq(_) | TypeKind::Map(..) => {
+                    crate::TYPE_BOOL.as_dyn()
+                }
+                kind => {
+                    typecheck_error!("`Contains` on non-collection type {kind:?}");
+                    crate::TYPE_ERR.as_dyn()
+                }
+            },
+            CollectionBinOpKind::Subset => {
+                if !matches!(
+                    self.lhs.ty().kind(),
+                    TypeKind::Set(_) | TypeKind::Multiset(_)
+                ) {
+                    typecheck_error!("`Subset` on non-set type {:?}", self.lhs.ty().kind());
+                }
+                crate::TYPE_BOOL.as_dyn()
+            }
+            CollectionBinOpKind::Union
+            | CollectionBinOpKind::Intersection
+            | CollectionBinOpKind::Difference => {
+                if !matches!(
+                    self.lhs.ty().kind(),
+                    TypeKind::Set(_) | TypeKind::Multiset(_)
+                ) {
+                    typecheck_error!(
+                        "`{:?}` on non-set type {:?}",
+                        self.kind,
+                        self.lhs.ty().kind()
+                    );
+                }
+                self.lhs.ty()
+            }
+            CollectionBinOpKind::Concat | CollectionBinOpKind::Take | CollectionBinOpKind::Drop => {
+                if !matches!(self.lhs.ty().kind(), TypeKind::Seq(_)) {
+                    typecheck_error!(
+                        "`{:?}` on non-`Seq` type {:?}",
+                        self.kind,
+                        self.lhs.ty().kind()
+                    );
+                }
+                self.lhs.ty()
+            }
+            CollectionBinOpKind::Index => match self.lhs.ty().kind() {
+                TypeKind::Seq(elem) => elem,
+                TypeKind::Map(_, val) => val,
+                kind => {
+                    typecheck_error!("`Index` on non-`Seq`/`Map` type {kind:?}");
+                    crate::TYPE_ERR.as_dyn()
+                }
+            },
+        }
     }
 }
 
@@ -76,11 +146,22 @@ pub struct TriggerGenData<'vir, Curr, Next> {
     pub exprs: &'vir [ExprGenDyn<'vir, Curr, Next>],
 }
 
+/// A literal of a native Viper collection (`Set`/`Multiset`/`Seq`/`Map`);
+/// which one is determined by `ty`. `Map` literals must be empty (maps are
+/// built up with [`CollectionUpdateGenData`]).
 #[derive(VirHash, VirReify, VirSerde)]
-pub struct SetLiteralGenData<'vir, Curr, Next> {
+pub struct CollectionLiteralGenData<'vir, Curr, Next> {
     pub values: &'vir [ExprGenDyn<'vir, Curr, Next>],
     #[vir(reify_pass, is_ref)]
     pub ty: TypeDyn<'vir>,
+}
+
+/// The native Viper map or sequence update `target[key := val]`.
+#[derive(VirHash, VirReify, VirSerde)]
+pub struct CollectionUpdateGenData<'vir, Curr, Next> {
+    pub target: ExprGenDyn<'vir, Curr, Next>,
+    pub key: ExprGenDyn<'vir, Curr, Next>,
+    pub val: ExprGenDyn<'vir, Curr, Next>,
 }
 
 #[derive(VirHash, VirReify, VirSerde)]
@@ -206,6 +287,21 @@ impl<'vir, Curr: 'vir, Next: 'vir, T: CompType> ExprGenData<'vir, Curr, Next, T>
             ty,
         }
     }
+
+    /// Create a copy of this expression, but with its span set to the current
+    /// top span. This allows error handlers to be attached to an expression
+    /// that was constructed elsewhere (by calling `realloc_span` within a
+    /// `with_span` closure).
+    pub fn realloc_span(&'vir self) -> ExprGen<'vir, Curr, Next, T> {
+        with_vcx(|vcx| {
+            vcx.alloc(Self {
+                kind: self.kind,
+                debug_info: self.debug_info,
+                span: vcx.top_span(),
+                ty: self.ty,
+            })
+        })
+    }
 }
 
 impl<'tcx> crate::VirCtxt<'tcx> {
@@ -256,11 +352,19 @@ pub enum ExprKindGenData<'vir, Curr: 'vir, Next: 'vir> {
     Unfolding(UnfoldingGen<'vir, Curr, Next>),
     UnOp(UnOpGen<'vir, Curr, Next>),
     BinOp(BinOpGen<'vir, Curr, Next>),
+    CollectionBinOp(CollectionBinOpGen<'vir, Curr, Next>),
     // perm ops?
     // container ops?
     // map ops?
     // sequence, map, set, multiset literals
-    SetLiteral(SetLiteralGen<'vir, Curr, Next>),
+    CollectionLiteral(CollectionLiteralGen<'vir, Curr, Next>),
+    CollectionUpdate(CollectionUpdateGen<'vir, Curr, Next>),
+    /// The length/cardinality of a native Viper collection.
+    CollectionLen(ExprGenDyn<'vir, Curr, Next>),
+    /// The domain (key set) of a native Viper `Map`.
+    MapDomain(ExprGenDyn<'vir, Curr, Next>),
+    /// The range (value set) of a native Viper `Map`.
+    MapRange(ExprGenDyn<'vir, Curr, Next>),
     Ternary(TernaryGen<'vir, Curr, Next>),
     Exists(ExistsGen<'vir, Curr, Next>),
     Forall(ForallGen<'vir, Curr, Next>),
@@ -269,7 +373,7 @@ pub enum ExprKindGenData<'vir, Curr: 'vir, Next: 'vir> {
     PredicateApp(PredicateAppGen<'vir, Curr, Next>), // TODO: this should not be used instead of acc?
     Wand(WandGen<'vir, Curr, Next>),
     // domain func app
-    // inhale/exhale
+    InhaleExhale(InhaleExhaleGen<'vir, Curr, Next>),
     Lazy(LazyGen<'vir, Curr, Next>),
 
     // Adt ops
@@ -296,7 +400,24 @@ impl<'vir, Curr, Next> ExprKindGenData<'vir, Curr, Next> {
             ExprKindGenData::Unfolding(f) => f.expr.ty(),
             ExprKindGenData::UnOp(u) => u.expr.ty().as_dyn(),
             ExprKindGenData::BinOp(b) => b.ty().as_dyn(),
-            ExprKindGenData::SetLiteral(s) => s.ty.as_dyn(),
+            ExprKindGenData::CollectionBinOp(b) => b.ty(),
+            ExprKindGenData::CollectionLiteral(s) => s.ty.as_dyn(),
+            ExprKindGenData::CollectionUpdate(u) => u.target.ty(),
+            ExprKindGenData::CollectionLen(_) => crate::TYPE_INT.as_dyn(),
+            ExprKindGenData::MapDomain(m) => match m.ty().kind() {
+                TypeKind::Map(key, _) => with_vcx(|vcx| vcx.mk_ty_set(*key).as_dyn()),
+                kind => {
+                    typecheck_error!("`MapDomain` of non-`Map` type {kind:?}");
+                    crate::TYPE_ERR.as_dyn()
+                }
+            },
+            ExprKindGenData::MapRange(m) => match m.ty().kind() {
+                TypeKind::Map(_, val) => with_vcx(|vcx| vcx.mk_ty_set(*val).as_dyn()),
+                kind => {
+                    typecheck_error!("`MapRange` of non-`Map` type {kind:?}");
+                    crate::TYPE_ERR.as_dyn()
+                }
+            },
             ExprKindGenData::Ternary(t) => t.then.ty(),
             ExprKindGenData::Forall(_) => crate::TYPE_BOOL.as_dyn(),
             ExprKindGenData::Exists(_) => crate::TYPE_BOOL.as_dyn(),
@@ -304,6 +425,7 @@ impl<'vir, Curr, Next> ExprKindGenData<'vir, Curr, Next> {
             ExprKindGenData::FuncApp(a) => a.result_ty,
             ExprKindGenData::PredicateApp(_) => crate::TYPE_BOOL.as_dyn(),
             ExprKindGenData::Wand(..) => crate::TYPE_BOOL.as_dyn(),
+            ExprKindGenData::InhaleExhale(..) => crate::TYPE_BOOL.as_dyn(),
             ExprKindGenData::Lazy(l) => l.ty,
             ExprKindGenData::AdtDestructor(_, destr) => destr.ty,
             ExprKindGenData::AdtDiscriminator(_, _) => crate::TYPE_BOOL.as_dyn(),
@@ -370,6 +492,12 @@ impl<'vir, Curr: 'vir, Next: 'vir> serde::Deserialize<'vir> for LazyGenData<'vir
     {
         panic!("cannot deserialize lazy expression")
     }
+}
+
+#[derive(VirHash, VirReify, VirSerde)]
+pub struct InhaleExhaleGenData<'vir, Curr: 'vir, Next: 'vir> {
+    pub inhale: ExprGenBool<'vir, Curr, Next>,
+    pub exhale: ExprGenBool<'vir, Curr, Next>,
 }
 
 #[derive(VirHash, VirReify, VirSerde)]
@@ -482,6 +610,7 @@ pub enum StmtKindGenData<'vir, Curr, Next> {
     PureAssign(PureAssignGen<'vir, Curr, Next>),
     Inhale(ExprGenBool<'vir, Curr, Next>),
     Exhale(ExprGenBool<'vir, Curr, Next>),
+    Refute(ExprGenBool<'vir, Curr, Next>),
     Unfold(PredicateAppGen<'vir, Curr, Next>),
     Fold(PredicateAppGen<'vir, Curr, Next>),
     Package(WandGen<'vir, Curr, Next>, &'vir [StmtGen<'vir, Curr, Next>]),
@@ -495,6 +624,19 @@ pub enum StmtKindGenData<'vir, Curr, Next> {
     Label(&'vir str),
     Comment(&'vir str),
     Dummy(&'vir str),
+}
+
+impl<'vir, Curr, Next> StmtKindGenData<'vir, Curr, Next> {
+    pub fn alloc(self) -> StmtGen<'vir, Curr, Next> {
+        with_vcx(|vcx| self.alloc_vcx(vcx))
+    }
+
+    pub(super) fn alloc_vcx<'tcx>(
+        self,
+        vcx: &'vir crate::VirCtxt<'tcx>,
+    ) -> StmtGen<'vir, Curr, Next> {
+        vcx.alloc(StmtGenData::new(vcx.alloc(self)))
+    }
 }
 
 #[derive(VirHash, VirReify, VirSerde)]

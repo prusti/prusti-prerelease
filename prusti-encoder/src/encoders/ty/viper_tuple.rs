@@ -51,6 +51,7 @@ impl<'vir> ViperTupleEncOutput<'vir> {
 
 impl TaskEncoder for ViperTupleEnc {
     task_encoder::encoder_cache!(ViperTupleEnc);
+    const ENCODER_NAME: &'static str = "Viper tuple encoder";
 
     type TaskDescription<'vir> = (DefId, Vec<ty::Ty<'vir>>);
     type TaskKey<'vir> = RustTyDecomposition<'vir>;
@@ -62,7 +63,7 @@ impl TaskEncoder for ViperTupleEnc {
         vir::with_vcx(|vcx| {
             let tys = vcx.tcx().mk_type_list(tys);
             let ty = vcx.tcx().mk_ty_from_kind(ty::TyKind::Tuple(tys));
-            RustTyDecomposition::from_ty(ty, vcx.tcx(), *def_id)
+            RustTyDecomposition::from_ty(ty, *def_id)
         })
     }
 

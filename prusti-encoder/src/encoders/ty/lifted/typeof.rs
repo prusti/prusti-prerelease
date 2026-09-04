@@ -3,7 +3,7 @@ use vir::FunctionIdn;
 
 use crate::encoders::ty::{RustTy, pure::TyPureEnc};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct TypeOfEncOutputRef<'vir> {
     /// Returns the Viper representation of the type of a snapshot-encoded value
     pub typeof_function: vir::FunctionIdn<'vir, vir::Snap, vir::TyVal>,
@@ -17,6 +17,7 @@ pub struct TypeOfEnc;
 
 impl TaskEncoder for TypeOfEnc {
     task_encoder::encoder_cache!(TypeOfEnc);
+    const ENCODER_NAME: &'static str = "typeof encoder";
     type TaskDescription<'tcx> = RustTy<'tcx>;
 
     type TaskKey<'tcx> = Self::TaskDescription<'tcx>;
@@ -38,7 +39,7 @@ impl TaskEncoder for TypeOfEnc {
         vir::with_vcx(|vcx| {
             let base_name = task_key.name();
             let domain = deps.require_ref::<TyPureEnc>(*task_key)?;
-            let snap = (domain.domain)();
+            let snap = domain.snapshot;
             let typeof_function = FunctionIdn::new(
                 vir::vir_format_identifier!(vcx, "s_{base_name}_typeof"),
                 snap,
@@ -52,7 +53,7 @@ impl TaskEncoder for TypeOfEnc {
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        let typeof_fns = Self::all_outputs_local_no_errors();
+        let typeof_fns = Self::all_outputs_local_no_errors(program);
         vir::with_vcx(|vcx| {
             let domain = vcx.mk_domain(
                 vir::ViperIdent::new("TypeOf"),

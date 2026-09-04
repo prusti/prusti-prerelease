@@ -36,32 +36,56 @@ impl<'vir, E: TaskEncoder + 'vir + ?Sized> TaskEncoderDependencies<'vir, E> {
         Ok(())
     }
 
-    fn require_common<T, EOther: TaskEncoder>(
+    fn require_common<T, EOther: TaskEncoder + 'vir>(
         &mut self,
         task: <EOther as TaskEncoder>::TaskDescription<'vir>,
         span: Option<Span>,
         res: Result<T, TaskEncoderError<EOther>>,
     ) -> Result<T, EncodeFullError<'vir, E>> {
+        if let (Some(span), Err(_)) = (span, &res) {
+            let task_key = EOther::task_to_key(&task);
+            EOther::with_cache(|cache| {
+                let mut cache = cache.borrow_mut();
+                match cache.get_mut(&task_key) {
+                    // TODO: we might push duplicate spans here.
+                    // It would be nice to reliably have one span per error location here.
+                    Some(TaskEncoderCacheState::ErrorEncode { spans, .. }) => spans.push(span),
+                    Some(TaskEncoderCacheState::ErrorEnqueue { spans, .. }) => spans.push(span),
+                    _ => {}
+                }
+            });
+        }
         res.map_err(|err| {
-            EncodeFullError::DependencyError(vec![
-                (
+            let mut chain = vec![(
+                EOther::ENCODER_NAME,
+                EOther::describe_task(task),
+                span.into_iter().collect(),
+            )];
+            match err {
+                TaskEncoderError::EnqueueingError(_) => chain.push((
                     EOther::ENCODER_NAME,
-                    EOther::describe_task(task),
-                    span.into_iter().collect(),
-                ),
-                (
-                    EOther::ENCODER_NAME,
-                    match err {
-                        TaskEncoderError::EnqueueingError(_) => "? EnqueueingError".to_string(),
-                        TaskEncoderError::EncodingError(err) => EOther::describe_error(err),
-                        TaskEncoderError::DependencyError(_items) => {
-                            "? DependencyError".to_string()
-                        }
-                        TaskEncoderError::CyclicError => "? CyclicError".to_string(),
-                    },
+                    "? EnqueueingError".to_string(),
                     Vec::new(),
-                ),
-            ])
+                )),
+                TaskEncoderError::EncodingError(err) => chain.push((
+                    EOther::ENCODER_NAME,
+                    EOther::describe_error(err),
+                    Vec::new(),
+                )),
+                // Flatten the nested chain so the underlying root cause (e.g. an
+                // unsupported-feature message) is preserved instead of being
+                // collapsed to an opaque "? DependencyError".
+                TaskEncoderError::DependencyError(items) => chain.extend(items),
+                TaskEncoderError::CyclicError => chain.push((
+                    EOther::ENCODER_NAME,
+                    "? CyclicError".to_string(),
+                    Vec::new(),
+                )),
+                TaskEncoderError::PanicError(_) => {
+                    chain.push((EOther::ENCODER_NAME, "? PanicError".to_string(), Vec::new()))
+                }
+            }
+            EncodeFullError::DependencyError(chain)
         })
         .and_then(|result| {
             self.check_cycle()?;
@@ -69,11 +93,15 @@ impl<'vir, E: TaskEncoder + 'vir + ?Sized> TaskEncoderDependencies<'vir, E> {
         })
     }
 
-    pub fn require_ref<EOther: TaskEncoder>(
+    pub fn require_ref<EOther: TaskEncoder + 'vir>(
         &mut self,
         task: <EOther as TaskEncoder>::TaskDescription<'vir>,
     ) -> Result<<EOther as TaskEncoder>::OutputRef<'vir>, EncodeFullError<'vir, E>> {
-        self.require_common(task.clone(), None, EOther::encode_ref(task))
+        self.require_common(
+            task.clone(),
+            None,
+            EOther::encode_ref(task, Span::default()),
+        )
     }
 
     pub fn require_local<EOther: TaskEncoder + 'vir>(
@@ -83,7 +111,7 @@ impl<'vir, E: TaskEncoder + 'vir + ?Sized> TaskEncoderDependencies<'vir, E> {
         self.require_common(
             task.clone(),
             None,
-            EOther::encode(task, true)
+            EOther::encode(task, true, Span::default())
                 .map(Option::unwrap)
                 .map(|(_output_ref, output_local, _output_dep)| output_local),
         )
@@ -96,18 +124,18 @@ impl<'vir, E: TaskEncoder + 'vir + ?Sized> TaskEncoderDependencies<'vir, E> {
         self.require_common(
             task.clone(),
             None,
-            EOther::encode(task, true)
+            EOther::encode(task, true, Span::default())
                 .map(Option::unwrap)
                 .map(|(_output_ref, _output_local, output_dep)| output_dep),
         )
     }
 
-    pub fn require_ref_spanned<EOther: TaskEncoder>(
+    pub fn require_ref_spanned<EOther: TaskEncoder + 'vir>(
         &mut self,
         task: <EOther as TaskEncoder>::TaskDescription<'vir>,
         span: Span,
     ) -> Result<<EOther as TaskEncoder>::OutputRef<'vir>, EncodeFullError<'vir, E>> {
-        self.require_common(task.clone(), Some(span), EOther::encode_ref(task))
+        self.require_common(task.clone(), Some(span), EOther::encode_ref(task, span))
     }
 
     pub fn require_local_spanned<EOther: TaskEncoder + 'vir>(
@@ -118,7 +146,7 @@ impl<'vir, E: TaskEncoder + 'vir + ?Sized> TaskEncoderDependencies<'vir, E> {
         self.require_common(
             task.clone(),
             Some(span),
-            EOther::encode(task, true)
+            EOther::encode(task, true, span)
                 .map(Option::unwrap)
                 .map(|(_output_ref, output_local, _output_dep)| output_local),
         )
@@ -132,7 +160,7 @@ impl<'vir, E: TaskEncoder + 'vir + ?Sized> TaskEncoderDependencies<'vir, E> {
         self.require_common(
             task.clone(),
             Some(span),
-            EOther::encode(task, true)
+            EOther::encode(task, true, span)
                 .map(Option::unwrap)
                 .map(|(_output_ref, _output_local, output_dep)| output_dep),
         )
@@ -148,12 +176,19 @@ impl<'vir, E: TaskEncoder + 'vir + ?Sized> TaskEncoderDependencies<'vir, E> {
             "output ref already set for task key {task_key:?}"
         );
         self.check_cycle()?;
-        assert!(E::with_cache(move |cache| matches!(
-            cache
-                .borrow_mut()
-                .insert(task_key, TaskEncoderCacheState::Started { output_ref },),
-            Some(TaskEncoderCacheState::Enqueued | TaskEncoderCacheState::Started { .. })
-        )));
+        E::with_cache(move |cache| {
+            let mut cache = cache.borrow_mut();
+            let new_state = match cache.get(&task_key) {
+                Some(TaskEncoderCacheState::Encoding) => {
+                    TaskEncoderCacheState::Started { output_ref }
+                }
+                Some(
+                    TaskEncoderCacheState::ReEncoding | TaskEncoderCacheState::Restarted { .. },
+                ) => TaskEncoderCacheState::Restarted { output_ref },
+                _ => std::panic!("output ref emitted for task not being encoded: {task_key:?}"),
+            };
+            cache.insert(task_key, new_state);
+        });
         Ok(())
     }
 }
