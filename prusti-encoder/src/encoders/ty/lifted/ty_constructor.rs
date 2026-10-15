@@ -1,7 +1,10 @@
 use task_encoder::{EncodeFullResult, OutputRefAny, TaskEncoder};
 use vir::{CallableIdn, CastType, FunctionIdn, HasType};
 
-use crate::encoders::ty::{RustParamData, RustTy, TySpecifics, generics::GenericParamsEnc};
+use crate::encoders::ty::{
+    RustParamData, RustTy, TySpecifics,
+    generics::{GenericParamsEnc, sizedness::SizednessEnc},
+};
 
 #[derive(Debug, Clone)]
 pub struct TyConstructorEncOutputRef<'vir> {
@@ -18,32 +21,6 @@ pub struct TyConstructorEncOutputRef<'vir> {
     /// Each function takes as input an instantiated type. The `i`th function in
     /// this list returns the `i`th const argument to the type constructor.
     pub const_param_accessors: &'vir [vir::AdtDestructor<'vir, vir::TyVal, vir::CSnap>],
-}
-
-impl<'vir> TyConstructorEncOutputRef<'vir> {
-    /// Takes as input this type's `typeof` function (from `TypeOfEnc`) and a
-    /// snapshot encoding of a rust value, and returns the `idx`th type
-    /// parameter of its type.
-    pub fn ty_param_from_snap(
-        &self,
-        idx: usize,
-        typeof_function: vir::FunctionIdn<'vir, vir::Snap, vir::TyVal>,
-        snap: vir::ExprCSnap<'vir>,
-    ) -> vir::ExprTyVal<'vir> {
-        self.ty_param_accessors[idx].call()(typeof_function(snap.upcast_ty()))
-    }
-
-    /// Takes as input this type's `typeof` function (from `TypeOfEnc`) and a
-    /// snapshot encoding of a rust value, and returns the `idx`th const
-    /// parameter of its type.
-    pub fn const_param_from_snap(
-        &self,
-        idx: usize,
-        typeof_function: vir::FunctionIdn<'vir, vir::Snap, vir::TyVal>,
-        snap: vir::ExprCSnap<'vir>,
-    ) -> vir::ExprCSnap<'vir> {
-        self.const_param_accessors[idx].call()(typeof_function(snap.upcast_ty()))
-    }
 }
 
 impl<'vir> OutputRefAny for TyConstructorEncOutputRef<'vir> {}
@@ -117,6 +94,7 @@ impl TaskEncoder for TyConstructorEnc {
                     const_param_accessors: vcx.alloc_slice(&const_accessor_functions),
                 },
             )?;
+            SizednessEnc::require(task_key);
 
             let args = ty_accessor_functions
                 .iter()
@@ -153,10 +131,4 @@ impl TyConstructorEnc {
     /// The name of the constructor for the unknown type variant in the `Type` ADT.
     pub const UNKNOWN_TYPE_NAME: &str = "Unknown_type";
     const UNKNOWN_TYPE_ID: &str = "id";
-
-    pub fn unknown_type_id_accessor<'vir>(
-        vcx: &'vir vir::VirCtxt<'vir>,
-    ) -> vir::AdtDestructor<'vir, vir::TyVal, vir::Int> {
-        vcx.mk_adt_destructor(Self::UNKNOWN_TYPE_ID, vir::TYPE_TYVAL, vir::TYPE_INT)
-    }
 }

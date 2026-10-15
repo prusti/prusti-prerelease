@@ -3,7 +3,9 @@ use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDe
 use vir::{CastType, FunctionIdn};
 
 use crate::encoders::ty::{
-    RustTy, RustTyDecomposition, interpretation::float::FloatDomain, pure::TyPurePrimDataKind,
+    RustTy, RustTyDecomposition, TySpecifics,
+    interpretation::float::FloatDomain,
+    pure::{TyPurePrimData, TyPurePrimDataKind},
     use_pure::TyUsePureEnc,
 };
 
@@ -76,12 +78,12 @@ impl TaskEncoder for MirBuiltinBinOpEnc {
                 let ty = RustTyDecomposition::identity(ty);
                 deps.require_dep::<TyUsePureEnc>(ty)
             };
-            let res = encode(lhs_ty)?;
-            let (l_ty_prim, l_ty_snap) = (res.expect_primitive(), res.snapshot.downcast_ty());
-            let res = encode(rhs_ty)?;
-            let (r_ty_prim, r_ty_snap) = (res.expect_primitive(), res.snapshot.downcast_ty());
-            let res = encode(result_ty.ty)?;
-            let res_ty_snap = res.snapshot.downcast_ty();
+            let lhs_ty_data = encode(lhs_ty)?;
+            let l_ty_snap = lhs_ty_data.snapshot.downcast_ty();
+            let rhs_ty_data = encode(rhs_ty)?;
+            let r_ty_snap = rhs_ty_data.snapshot.downcast_ty();
+            let res_ty_data = encode(result_ty.ty)?;
+            let res_ty_snap = res_ty_data.snapshot.downcast_ty();
 
             let name = vir::vir_format_identifier!(
                 vcx,
@@ -95,8 +97,17 @@ impl TaskEncoder for MirBuiltinBinOpEnc {
             let rhs_decl = vcx.mk_local_decl("arg2", r_ty_snap);
             let lhs = vcx.mk_local_ex(lhs_decl);
             let rhs = vcx.mk_local_ex(rhs_decl);
-            let (pres, body) = match l_ty_prim.kind {
-                TyPurePrimDataKind::Bool | TyPurePrimDataKind::Int(_) => {
+            let (pres, body) = match lhs_ty_data.specifics {
+                TySpecifics::Raw(..) => {
+                    let body = Self::handle_bin_op_raw(vcx, lhs, rhs, op)?;
+                    (Vec::new(), body)
+                }
+                TySpecifics::Primitive(
+                    l_ty_prim @ TyPurePrimData {
+                        kind: TyPurePrimDataKind::Bool | TyPurePrimDataKind::Int(_),
+                    },
+                ) => {
+                    let r_ty_prim = rhs_ty_data.expect_primitive();
                     let lhs = l_ty_prim.snap_to_prim(lhs);
                     let rhs = r_ty_prim.snap_to_prim(rhs);
                     // `l_ty` is the type the operation is performed in. The operands
@@ -113,14 +124,18 @@ impl TaskEncoder for MirBuiltinBinOpEnc {
                         let res_ty = *result_ty.ty.expect_primitive();
                         let (pres, val) =
                             Self::handle_bin_op_native(vcx, lhs, rhs, res_ty, op, l_ty)?;
-                        (pres, res.expect_primitive().prim_to_snap(val))
+                        (pres, res_ty_data.expect_primitive().prim_to_snap(val))
                     }
                 }
-                TyPurePrimDataKind::Float(float) => {
+                TySpecifics::Primitive(TyPurePrimData {
+                    kind: TyPurePrimDataKind::Float(float),
+                }) => {
+                    let r_ty_prim = rhs_ty_data.expect_primitive();
                     assert!(matches!(r_ty_prim.kind, TyPurePrimDataKind::Float(_)));
                     let body = Self::handle_bin_op_float(vcx, lhs, rhs, op, float);
                     (Vec::new(), body)
                 }
+                _ => unreachable!(),
             };
             let pres = vcx.alloc_slice(&pres);
             let function =
@@ -301,6 +316,37 @@ impl MirBuiltinBinOpEnc {
         }
     }
 
+    fn handle_bin_op_raw<'vir>(
+        vcx: &'vir vir::VirCtxt<'vir>,
+        lhs: vir::ExprCSnap<'vir>,
+        rhs: vir::ExprCSnap<'vir>,
+        op: mir::BinOp,
+    ) -> EncodeResult<'vir, vir::ExprCSnap<'vir>> {
+        use mir::BinOp::*;
+        match op {
+            Eq => Ok(vcx.mk_eq_expr(lhs, rhs).upcast_ty()),
+            Ne => {
+                let eq = vcx.mk_eq_expr(lhs, rhs).upcast_ty();
+                let ne = vcx.mk_unary_op_expr(vir::UnOpKind::Not, eq);
+                Ok(ne.downcast_ty::<vir::Bool>().upcast_ty())
+            }
+            // We do not encode addresses as Ints yet
+            // We cannot compare Viper refs using <, <=, >=, >, or use offset
+            Lt | Le | Ge | Gt => Err(EncodeFullError::EncodingError(
+                MirBuiltinBinOpEncError::Unsupported(format!(
+                    "ordering comparison `{op:?}` on raw pointers"
+                )),
+                None,
+            )),
+            Offset => Err(EncodeFullError::EncodingError(
+                MirBuiltinBinOpEncError::Unsupported("pointer offset".to_string()),
+                None,
+            )),
+            // Raw pointers support no arithmetic, bitwise, or shift operators
+            _ => unreachable!("`{op:?}` cannot occur on raw pointer operands"),
+        }
+    }
+
     fn handle_bin_op_float<'vir>(
         vcx: &'vir vir::VirCtxt<'vir>,
         lhs: vir::ExprCSnap<'vir>,
@@ -394,6 +440,18 @@ impl MirBuiltinBinOpEnc {
         let val_decl = vcx.mk_local_decl("val", prim_type);
         let val = vcx.mk_local_ex(val_decl);
         // Wrapped value
+        //
+        // The eager `mod` below is costly when `val` is nonlinear: under Z3's
+        // legacy arithmetic solver (`smt.arith.solver=2`) the checks around it
+        // can exhaust their resource budget, so the server selects solver 6.
+        // Should that ever need reverting, an encoding that stayed robust
+        // under solver 2 is to keep `mod` out of the in-range path entirely:
+        //   wrapped_val = in_range(val) ? val : wrap_N(val)
+        //   overflowed  = !in_range(val)
+        // with `wrap_N` an uninterpreted domain function axiomatised as
+        // `forall x :: {wrap_N(x)} wrap_N(x) == get_wrapped_val(x)`. The flag
+        // must not mention `wrapped_val`, or `mod` is pulled back in; any
+        // form that leaves a `mod` term on the in-range path stays fragile.
         let wrapped_val_decl = vcx.mk_local_decl("wrapped_val", prim_type);
         let wrapped_val_exp = vcx.get_wrapped_val(val, res_ty_int.kind());
         let wrapped_val = vcx.mk_local_ex(wrapped_val_decl);

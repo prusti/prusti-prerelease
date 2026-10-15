@@ -53,7 +53,7 @@ pub fn verify_programs(
             VerificationRequest {
                 program,
                 procedures,
-                backend_config: ViperBackendConfig::new(backend),
+                backend_config: ViperBackendConfig::new(backend, config::verify_mode()),
             }
         })
         .collect();
@@ -485,7 +485,7 @@ fn verify_requests_local<'a>(
                 if let Some(result) = Lazy::force(cache).get(request_hash) {
                     info!(
                         "Using cached result {:?}",
-                        &result,
+                        result,
                     );
                     yield futures::stream::once(async move {
                         ServerMessage::Termination(result)
@@ -497,7 +497,7 @@ fn verify_requests_local<'a>(
                     if config::enable_cache() && !matches!(result.kind, viper::VerificationResultKind::JavaException(_)) {
                         info!(
                             "Storing new cached result {:?}",
-                            &result,
+                            result,
                         );
                         cache.insert(request_hash, result.clone());
                     }

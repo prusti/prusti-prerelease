@@ -1,7 +1,7 @@
 use std::ops::Deref;
 
 use prusti_interface::environment::EnvQuery;
-use prusti_rustc_interface::{abi, hir, index, middle::ty, span::symbol};
+use prusti_rustc_interface::{abi, hir::attrs::LangItem, index, middle::ty, span::symbol};
 
 use super::{
     data::*,
@@ -74,6 +74,7 @@ impl<'tcx> RustTyDecomposition<'tcx> {
             name: symbol::Symbol::intern("Param"),
             params: GParams::empty_env(gty),
             special: RustTySpecial::None,
+            sizedness: RustTySizedness::None,
         };
         let specifics = TySpecifics::Param(RustParamData::Generic);
         TyData::<RustTyDatas>::new(data, specifics).alloc()
@@ -118,11 +119,15 @@ impl<'tcx> LazyRustTy<'tcx> {
     /// The pointer metadata type of a pointer to this type.
     fn pointee_metadata(self) -> Self {
         vir::with_vcx(|vcx| {
-            let metadata_did = vcx.tcx().require_lang_item(
-                hir::LangItem::Metadata,
-                prusti_rustc_interface::span::DUMMY_SP,
-            );
-            Self::new(ty::Ty::new_projection(vcx.tcx(), metadata_did, [self.0]))
+            let metadata_did = vcx
+                .tcx()
+                .require_lang_item(LangItem::Metadata, prusti_rustc_interface::span::DUMMY_SP);
+            Self::new(ty::Ty::new_projection(
+                vcx.tcx(),
+                ty::IsRigid::No,
+                metadata_did,
+                [self.0],
+            ))
         })
     }
 }
@@ -260,6 +265,53 @@ pub struct RustTyData<'tcx> {
     pub name: symbol::Symbol,
     pub params: GParams<'tcx>,
     pub special: RustTySpecial,
+    pub sizedness: RustTySizedness<'tcx>,
+}
+
+/// Which of the sizedness traits (`Sized`, `MetaSized`, `PointeeSized`) the
+/// constructor's instances implement. These traits have no impls, so their
+/// facts are encoded per constructor instead (see `SizednessEnc`). Mirrors
+/// `Ty::has_trivial_sizedness`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RustTySizedness<'tcx> {
+    /// Not a type constructor (a type parameter or projection).
+    None,
+    /// `Sized` and `MetaSized` exactly when the respective tail type, over
+    /// the constructor's parameters, is; unconditionally if there is none.
+    Sized {
+        sized_if: Option<ty::Ty<'tcx>>,
+        meta_sized_if: Option<ty::Ty<'tcx>>,
+    },
+    /// `MetaSized` but not `Sized`: `str`, slices and trait objects.
+    MetaSized,
+    /// Only `PointeeSized`: extern types.
+    PointeeSized,
+}
+
+impl<'tcx> RustTySizedness<'tcx> {
+    fn from_ty(ty: ty::Ty<'tcx>) -> Self {
+        let tail = |kind| match *ty.kind() {
+            ty::TyKind::Adt(adt, _) => vir::with_vcx(|vcx| {
+                adt.sizedness_constraint(vcx.tcx(), kind)
+                    .map(ty::EarlyBinder::instantiate_identity)
+                    .map(ty::Unnormalized::skip_normalization)
+            }),
+            ty::TyKind::Tuple(tys) => tys
+                .len()
+                .checked_sub(1)
+                .map(|last| TySpecifics::new_param_ty(last as u32)),
+            _ => None,
+        };
+        match ty.kind() {
+            ty::TyKind::Param(_) | ty::TyKind::Alias(..) => Self::None,
+            ty::TyKind::Str | ty::TyKind::Slice(_) | ty::TyKind::Dynamic(..) => Self::MetaSized,
+            ty::TyKind::Foreign(_) => Self::PointeeSized,
+            _ => Self::Sized {
+                sized_if: tail(ty::SizedTraitKind::Sized),
+                meta_sized_if: tail(ty::SizedTraitKind::MetaSized),
+            },
+        }
+    }
 }
 
 /// Marks types with extra hardcoded treatment on top of their regular encoding.
@@ -372,6 +424,7 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
             name: symbol::Symbol::intern(&name),
             params,
             special: RustTySpecial::from_ty(ty),
+            sizedness: RustTySizedness::from_ty(ty),
         };
         RustTyDecomposition::new(Self::new(data, specifics).alloc(), args)
     }
@@ -384,6 +437,7 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
             name: symbol::Symbol::intern(&name),
             params,
             special: RustTySpecial::None,
+            sizedness: RustTySizedness::from_ty(ty),
         };
         let specifics = TySpecifics::from_prim_ty(ty);
         RustTyDecomposition::new(Self::new(data, specifics).alloc(), args)
@@ -414,6 +468,7 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
             ty::TyKind::Slice(..) => String::from("Slice"),
             ty::TyKind::Dynamic(..) => String::from("Dyn"),
             ty::TyKind::Foreign(def_id) | ty::TyKind::FnDef(def_id, _) => def_id_name(*def_id),
+            ty::TyKind::Pat(ty, _) => Self::ty_name(*ty),
             other => unimplemented!("ty_name for {:?}", other),
         }
     }
@@ -511,9 +566,10 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
                 let gargs = identity_params(vcx.tcx(), did);
                 (
                     GParams::new(gargs, vcx.tcx().param_env(did), is_trait_extern_spec),
-                    args,
+                    args.skip_binder(),
                 )
             }),
+            ty::TyKind::Pat(ty, _) => Self::identity_for_ty(ty, is_trait_extern_spec),
             ty::TyKind::Never
             | ty::TyKind::Str
             | ty::TyKind::FnPtr(..)
@@ -630,7 +686,7 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
                         .map(|(i, ty)| RustFieldData {
                             name: symbol::Symbol::intern(&format!("c{i}")),
                             fid: abi::FieldIdx::from_usize(i),
-                            ty: LazyRustTy(vcx.tcx().erase_regions(ty)),
+                            ty: LazyRustTy(vcx.tcx().erase_and_anonymize_regions(ty)),
                             address: RustFieldAddress::Constant,
                         })
                         .collect::<Vec<_>>()
@@ -648,6 +704,11 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
             // TODO: give dyn Trait a type witness parameter (the concrete type behind the
             // pointer), enabling virtual dispatch and distinguishing dyn TraitA from dyn TraitB.
             ty::TyKind::Dynamic(..) => TySpecifics::mk_param(RustParamData::Dyn),
+            // TODO: encode the pattern as narrowed bounds on the base type, so that e.g.
+            // the `u32 is 1..` inside a `NonZeroU32` is known to be non-zero. Doing so
+            // also needs a `ty_name` that distinguishes the pattern from its base type,
+            // since the name and the specifics together are the interning key.
+            ty::TyKind::Pat(ty, _) => Self::from_ty(*ty),
             _ => TySpecifics::mk_opaque(()),
         }
     }
@@ -658,9 +719,8 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
     }
 
     fn from_adt(adt: ty::AdtDef<'tcx>) -> Self {
-        if vir::with_vcx(|vcx| {
-            vcx.tcx().lang_items().get(hir::LangItem::DynMetadata) == Some(adt.did())
-        }) {
+        if vir::with_vcx(|vcx| vcx.tcx().lang_items().get(LangItem::DynMetadata) == Some(adt.did()))
+        {
             // `DynMetadata<dyn Trait>` is the metadata of a `&dyn`/`*dyn`
             // wide pointer. We never reason about vtable contents, so encode it
             // as an opaque snapshot rather than recursing into its `Foreign`
@@ -764,7 +824,7 @@ impl<'tcx> TySpecifics<'tcx, RustTyDatas> {
                 RustFieldData {
                     name: field.name,
                     fid,
-                    ty: LazyRustTy(ty),
+                    ty: LazyRustTy(ty.skip_normalization()),
                     address: RustFieldAddress::Constant,
                 }
             })

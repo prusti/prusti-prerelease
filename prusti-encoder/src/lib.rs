@@ -2,8 +2,6 @@
 #![feature(associated_type_defaults)]
 #![feature(box_patterns)]
 #![feature(never_type)]
-#![feature(allocator_api)]
-#![feature(if_let_guard)]
 #![allow(clippy::needless_lifetimes)]
 
 mod encoders;
@@ -21,16 +19,19 @@ use task_encoder::TaskEncoder;
 use crate::encoders::{
     ConstEnc, Impure, Pure,
     addr::RefDataEnc,
-    custom::PairUseEnc,
+    custom::{PairUseEnc, ReadPermEnc},
     ty::{
         generics::{
             GArgsCastEnc,
+            sizedness::SizednessEnc,
             r#trait::TraitEnc,
             trait_fn::TraitFnEnc,
-            trait_impls::{TraitImplEnc, TraitImplItemEnc},
+            trait_impls::{
+                TraitImplConditionEnc, TraitImplDefaultFnEnc, TraitImplEnc, TraitImplItemEnc,
+            },
         },
         interpretation::bitvec::BitVecEnc,
-        lifted::{TyConstructorEnc, TypeOfEnc},
+        lifted::TyConstructorEnc,
     },
 };
 
@@ -121,7 +122,6 @@ pub fn test_entrypoint<'tcx>(
 
     program.header("type constructors");
     TyConstructorEnc::emit_outputs(&mut program);
-    TypeOfEnc::emit_outputs(&mut program);
     crate::encoders::TyInhabitedEnc::emit_outputs(&mut program);
 
     program.header("constants");
@@ -129,13 +129,17 @@ pub fn test_entrypoint<'tcx>(
 
     program.header("custom");
     PairUseEnc::emit_outputs(&mut program);
+    ReadPermEnc::emit_outputs(&mut program);
     RefDataEnc::emit_outputs(&mut program);
 
     program.header("traits");
     TraitEnc::emit_outputs(&mut program);
+    SizednessEnc::emit_outputs(&mut program);
     TraitFnEnc::emit_outputs(&mut program);
     TraitImplEnc::emit_outputs(&mut program);
+    TraitImplConditionEnc::emit_outputs(&mut program);
     TraitImplItemEnc::emit_outputs(&mut program);
+    TraitImplDefaultFnEnc::emit_outputs(&mut program);
 
     if std::env::var("LOCAL_TESTING").is_ok() {
         std::fs::write("local-testing/simple.vpr", program.code()).unwrap();

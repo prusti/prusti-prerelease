@@ -10,7 +10,10 @@ use crate::encoders::{
     Impure, ImpureEncVisitor, MirLocalDefEnc, MirLocalDefEncTask, MirSpecEnc, WandEnc, WandEncTask,
     mir_fn::{CallTaskDescription, RustSignature, SpecBlocks, SpecBlocksEnc},
     pure::spec::MirSpecEncMode,
-    ty::generics::{GArgCaster, GArgsCastEnc, GArgsTy, GArgsTyEnc, GParams, GenericParamsEnc},
+    ty::generics::{
+        GArgCaster, GArgsCastEnc, GArgsTy, GArgsTyEnc, GParams, GenericParamsEnc,
+        trait_impls::TraitImplEnc,
+    },
 };
 
 // Method wrapper
@@ -121,7 +124,10 @@ pub(super) struct MethodEncOutput<'vir> {
 }
 
 #[derive(Clone, Debug)]
-pub enum MethodEncError {}
+pub enum MethodEncError {
+    /// The method cannot be encoded; this was reported as an early error.
+    Reported,
+}
 
 impl TaskEncoder for MethodEnc {
     task_encoder::encoder_cache!(MethodEnc);
@@ -135,6 +141,10 @@ impl TaskEncoder for MethodEnc {
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
         *task
+    }
+
+    fn error_reported(error: &Self::EncodingError) -> bool {
+        matches!(error, MethodEncError::Reported)
     }
 
     fn do_encode_full<'vir>(
@@ -197,12 +207,25 @@ impl TaskEncoder for MethodEnc {
                 span,
             )?;
             let function_data = FunctionData::new(def_id);
-            let wands = deps.require_dep_spanned::<WandEnc>(
-                WandEncTask {
-                    data: function_data,
-                },
-                span,
-            )?;
+            let wands = deps
+                .require_dep_spanned::<WandEnc>(
+                    WandEncTask {
+                        data: function_data,
+                    },
+                    span,
+                )
+                .map_err(|err| {
+                    // Without its wands, the method has no contract.
+                    let (message, _) = super::dep_error(&err);
+                    vcx.emit_early_error(PrustiError::unsupported(
+                        format!(
+                            "cannot encode method `{}`: {message}",
+                            vcx.tcx().def_path_str(def_id),
+                        ),
+                        vcx.tcx().def_span(def_id).into(),
+                    ));
+                    EncodeFullError::EncodingError(MethodEncError::Reported, None)
+                })?;
 
             // Add direct resources for inputs and outputs to the pre- and
             // postconditions, respectively. "Direct" here refers to owned
@@ -249,7 +272,7 @@ impl TaskEncoder for MethodEnc {
                     // extra blocks: Start, End
                     2 + block_count,
                 );
-                let mut start_stmts = Vec::new();
+                let mut start_stmts = TraitImplEnc::assume_context_bounds(vcx, deps, params)?;
                 for local in (arg_count..body.local_decls.len()).map(mir::Local::from) {
                     // Spec-only locals have no definition.
                     let Some(local_def) = local_defs.get(local) else {
